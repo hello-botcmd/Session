@@ -35,8 +35,15 @@ async def make_client(raw: str) -> TelegramClient:
 async def _connect(client: TelegramClient) -> None:
     if not client.is_connected():
         await asyncio.wait_for(client.connect(), timeout=15)
-    if not await client.is_user_authorized():
-        raise ValueError("Session is expired, revoked, or not authorized")
+    try:
+        authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=10)
+    except Exception as exc:
+        raise ValueError(f"Could not check authorization: {type(exc).__name__}: {exc}") from exc
+    if not authorized:
+        raise ValueError(
+            "Session is not authorized. "
+            "The auth key is dead, on the wrong DC, or the format was misread."
+        )
 
 
 async def verify(raw: str) -> tuple[dict, TelegramClient]:
