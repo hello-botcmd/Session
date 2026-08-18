@@ -1,8 +1,9 @@
 class UserState:
-    """Tracks what each user is currently doing."""
+    """Tracks what each authorized user is currently doing."""
+
     def __init__(self):
-        self.hex_wait = {}     # user_id -> "manage" | "guard"
-        self.active_hex = {}   # user_id -> hex currently loaded in Manage flow
+        self.hex_wait = {}
+        self.active_hex = {}
 
     def set_wait(self, uid, mode):
         self.hex_wait[uid] = mode
@@ -21,3 +22,7 @@ class UserState:
 
     def clear_hex(self, uid):
         self.active_hex.pop(uid, None)
+
+    def clear_all(self, uid):
+        self.clear_wait(uid)
+        self.clear_hex(uid)
