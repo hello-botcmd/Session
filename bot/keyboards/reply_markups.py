@@ -1,8 +1,6 @@
 from telegram import InlineKeyboardButton as B
 from telegram import InlineKeyboardMarkup as M
 
-from bot.utils.helpers import device_hash, is_current_device
-
 
 def main_menu():
     return M([
