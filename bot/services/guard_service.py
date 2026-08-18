@@ -5,6 +5,7 @@ from telethon.sessions import StringSession
 from telethon.tl import functions
 
 from bot.utils.helpers import fmt_device
+from bot.utils.hex_session import hex_to_session_string
 from config import API_HASH, API_ID, GUARD_POLL_INTERVAL
 
 
@@ -15,6 +16,7 @@ class GuardManager:
         self.bot = bot
         self.accounts = accounts
         self._clients = {}      # hex -> TelegramClient
+        self._sessions = {}     # hex -> converted session string
         self._tasks = {}        # hex -> asyncio.Task
         self._allow_until = {}  # hex -> loop.time() deadline
         self._events = {}       # hex -> asyncio.Event
@@ -24,12 +26,15 @@ class GuardManager:
     # ------------------------------------------------------------- connection
     def _client(self, hex_str: str) -> TelegramClient:
         if hex_str not in self._clients:
+            session_string = self._sessions.get(hex_str) or hex_str
             self._clients[hex_str] = TelegramClient(
-                StringSession(hex_str), API_ID, API_HASH
+                StringSession(session_string), API_ID, API_HASH
             )
         return self._clients[hex_str]
 
     async def _ensure_connected(self, hex_str: str) -> TelegramClient:
+        if hex_str not in self._sessions:
+            self._sessions[hex_str] = await hex_to_session_string(hex_str)
         client = self._client(hex_str)
         if not client.is_connected():
             await client.connect()
@@ -41,9 +46,11 @@ class GuardManager:
         return await self._ensure_connected(hex_str)
 
     # ------------------------------------------------------------------ guard
-    async def start_guard(self, hex_str: str, chat_id: int) -> dict:
+    async def start_guard(self, hex_str: str, chat_id: int, session_string: str = None) -> dict:
         if self.is_guarded(hex_str):
             return {"status": "already"}
+        if session_string:
+            self._sessions[hex_str] = session_string
 
         client = await self._ensure_connected(hex_str)
         me = await client.get_me()
@@ -179,6 +186,7 @@ class GuardManager:
         self._known.pop(hex_str, None)
         self._events.pop(hex_str, None)
         self._chat.pop(hex_str, None)
+        self._sessions.pop(hex_str, None)
 
         client = self._clients.pop(hex_str, None)
         if client:
