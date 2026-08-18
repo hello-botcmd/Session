@@ -120,7 +120,7 @@ def _parse_mail(text: str) -> tuple[str, str] | None:
         email, password = payload.split("----", 1)
     else:
         parts = payload.split(None, 1)
-        if len(parts) <
+        if len(parts) < 2:
       return None
     email, password = email.strip(), password.strip()
     if "@" not in email or not password:
