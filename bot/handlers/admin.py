@@ -2,7 +2,6 @@ from telegram import Update
 from telegram.ext import ApplicationHandlerStop, CommandHandler, ContextTypes, TypeHandler
 
 from bot.keyboards.reply_markups import main_menu
-from bot.utils.helpers import h
 
 
 HELP = (
