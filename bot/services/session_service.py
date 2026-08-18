@@ -6,16 +6,37 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl import functions
 
+from bot.services.account_service import AccountService
+from bot.utils.hex_session import hex_to_session_string
 from config import API_HASH, API_ID
+
 
 OTP_RE = re.compile(r"(?:code|otp|verification)[^\d]{0,30}?(\d{5,6})", re.I)
 CODE_RE = re.compile(r"\b\d{5,6}\b")
 
 
 # ---------------------------------------------------------------- connection
+_session_string_cache = {}
+
+
+async def get_session_string(hex_str: str) -> str:
+    """Converted session string, with Mongo as a persistent cache
+    (so DC discovery only runs once per account)."""
+    hex_str = hex_str.strip()
+    if hex_str in _session_string_cache:
+        return _session_string_cache[hex_str]
+    acc = AccountService().get(hex_str)
+    if acc and acc.get("session_string"):
+        _session_string_cache[hex_str] = acc["session_string"]
+        return acc["session_string"]
+    s = await hex_to_session_string(hex_str)
+    _session_string_cache[hex_str] = s
+    return s
+
+
 async def make_client(hex_str: str) -> TelegramClient:
-    """Connect a Telethon client from a session hex string."""
-    client = TelegramClient(StringSession(hex_str), API_ID, API_HASH)
+    session_string = await get_session_string(hex_str)
+    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
     await client.connect()
     if not await client.is_user_authorized():
         raise ValueError("Session is expired, revoked or invalid")
