@@ -3,7 +3,7 @@ from telegram.ext import CallbackQueryHandler, ContextTypes
 
 from bot.keyboards.reply_markups import cancel_only, main_menu
 from bot.services import session_service
-from bot.utils.helpers import fmt_phone, is_hex
+from bot.utils.helpers import fmt_phone
 
 
 async def guard_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -25,6 +25,7 @@ async def guard_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_hex(update: Update, ctx: ContextTypes.DEFAULT_TYPE, hex_str: str):
     uid = update.effective_user.id
     msg = await update.message.reply_text("🛡️ Verifying & connecting session...")
+    client = None
     try:
         info, client = await session_service.verify(hex_str)
     except Exception as e:
@@ -34,10 +35,11 @@ async def handle_hex(update: Update, ctx: ContextTypes.DEFAULT_TYPE, hex_str: st
         )
         return
     finally:
-        try:
-            client.disconnect()
-        except Exception:
-            pass
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
     await msg.edit_text(
         f"✅ *Session verified*\n\n"
@@ -49,7 +51,10 @@ async def handle_hex(update: Update, ctx: ContextTypes.DEFAULT_TYPE, hex_str: st
 
     guard = ctx.bot_data["guard"]
     try:
-        result = await guard.start_guard(hex_str, update.effective_chat.id)
+        session_string = await session_service.get_session_string(hex_str)
+        result = await guard.start_guard(
+            hex_str, update.effective_chat.id, session_string=session_string
+        )
     except Exception as e:
         await msg.edit_text(
             f"❌ Guard start failed:\n`{e}`", reply_markup=main_menu()
@@ -63,6 +68,7 @@ async def handle_hex(update: Update, ctx: ContextTypes.DEFAULT_TYPE, hex_str: st
         "spam": info["spam"],
         "devices": info["devices"],
         "active": True,
+        "session_string": session_string,
     })
 
     if result["status"] == "already":
