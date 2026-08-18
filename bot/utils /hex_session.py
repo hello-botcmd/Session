@@ -1,45 +1,31 @@
-"""Convert a panel hex auth_key into a real Telethon StringSession.
+    """
+Convert an authorized Telegram auth_key/session into a Telethon StringSession.
 
-A raw 256-byte auth_key carries NO dc_id - it is 256 random bytes and its DC
-binding exists only on Telegram's side. "Detecting the DC" therefore means
-probing the key against DCs 1-5 and letting the server answer
-AUTH_KEY_UNREGISTERED (wrong DC / dead key) or accept the init request.
+Supported inputs:
+    1. Existing Telethon StringSession
+    2. Hex-encoded Telethon StringSession
+    3. Raw 256-byte auth_key
+    4. DC + auth_key panel formats
 
-That probe is a real network round-trip, so the host MUST be able to reach
-Telegram. If Telegram is blocked on the host, set PROXY below - otherwise
-every probe fails at TCP level and even a valid key reports "not authorized".
+For a bare 256-byte auth_key, the DC is not encoded in the key itself,
+so the verifier checks the known Telegram production DCs.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
+from typing import Optional
 
-try:
-    from telethon import TelegramClient, __version__ as _TL_VER
-    from telethon.crypto import AuthKey
-    from telethon.sessions import StringSession
-except ImportError as exc:  # Telethon v2 removed StringSession entirely
-    raise ImportError(
-        "Telethon is missing or is v2.x. Install: "
-        "pip install 'telethon>=1.28,<2'"
-    ) from exc
+from telethon import TelegramClient
+from telethon.crypto import AuthKey
+from telethon.sessions import StringSession
 
 from config import API_HASH, API_ID
 
+
 log = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Network config
-# ---------------------------------------------------------------------------
-# Required if the verifier's host cannot reach Telegram directly.
-#   PROXY = {"hostname": "127.0.0.1", "port": 1080,
-#            "username": "...", "password": "..."}
-# Requires: pip install python-socks[asyncio]
-PROXY: dict | None = None
-
-USE_IPV6 = False          # try IPv6 DC addresses when IPv4 is blocked/throttled
-PROBE_TIMEOUT = 15        # seconds per DC attempt
 
 DC_IPV4 = {
     1: "149.154.175.53",
@@ -48,220 +34,377 @@ DC_IPV4 = {
     4: "149.154.167.91",
     5: "91.108.56.130",
 }
-DC_IPV6 = {
-    1: "2001:b28:f23d:f001::a",
-    2: "2001:67c:4e8:f002::a",
-    3: "2001:b28:f23d:f003::a",
-    4: "2001:67c:4e8:f004::a",
-    5: "2001:b28:f23f:f005::a",
-}
 
 _cache: dict[str, str] = {}
 
 
-def _is_hex(s: str) -> bool:
-    s = s.strip()
-    return bool(s) and len(s) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in s)
+def _is_hex(value: str) -> bool:
+    value = value.strip()
+
+    return (
+        bool(value)
+        and len(value) % 2 == 0
+        and all(c in "0123456789abcdefABCDEF" for c in value)
+    )
 
 
-def _bad_hex_reason(s: str) -> str:
-    """Explain why a hex-looking token is invalid."""
-    s = s.strip()
-    if not s:
-        return "empty input"
-    if len(s) % 2 == 1:
-        return (
-            f"hex length is ODD ({len(s)} chars = {len(s) // 2} bytes + 1 nibble). "
-            "A digit is missing or the token was truncated."
-        )
-    for i, c in enumerate(s):
-        if c not in "0123456789abcdefABCDEF":
-            return f"non-hex character {c!r} at position {i}"
-    return f"valid hex, {len(s) // 2} bytes"
-
-
-def _looks_like_telethon(s: str) -> bool:
-    """Telethon strings start with version char '1' and are urlsafe base64."""
-    if not s or s[0] != "1" or len(s) < 50:
+def _looks_like_telethon(value: str) -> bool:
+    """
+    Check whether value is a valid Telethon StringSession.
+    """
+    if not value or not value.startswith("1"):
         return False
+
     try:
-        StringSession(s)
+        StringSession(value)
         return True
     except Exception:
         return False
 
 
 def make_string(dc_id: int, auth_key: bytes) -> str:
-    """Let Telethon encode dc + ip + port + key. This is the only correct way."""
+    """
+    Build a Telethon StringSession from a DC and 256-byte auth key.
+    """
+
     if dc_id not in DC_IPV4:
-        raise ValueError(f"Unknown DC {dc_id}")
+        raise ValueError(f"Unknown Telegram DC: {dc_id}")
+
     if len(auth_key) != 256:
-        raise ValueError(f"auth_key must be 256 bytes, got {len(auth_key)}")
-    address = DC_IPV6[dc_id] if USE_IPV6 else DC_IPV4[dc_id]
+        raise ValueError(
+            f"auth_key must be exactly 256 bytes, got {len(auth_key)}"
+        )
+
     session = StringSession()
-    session.set_dc(dc_id, address, 443)
+
+    session.set_dc(
+        dc_id,
+        DC_IPV4[dc_id],
+        443,
+    )
+
     session.auth_key = AuthKey(auth_key)
-    saved = session.save()
-    if not saved:
-        raise ValueError("Telethon refused to save the session (empty auth_key?)")
-    # Round-trip sanity: the string must decode back to the same key
-    check = StringSession(saved)
-    if check.auth_key is None or check.auth_key.key != auth_key:
-        raise ValueError("round-trip mismatch while building session string")
-    return saved
+
+    result = session.save()
+
+    if not result:
+        raise ValueError("Telethon failed to serialize the session")
+
+    return result
 
 
-def _extract_keys(raw: bytes) -> list[tuple[int | None, bytes]]:
-    """Return (dc_hint, auth_key) candidates from raw panel bytes."""
-    out: list[tuple[int | None, bytes]] = []
+def _extract_candidates(
+    raw: bytes,
+) -> list[tuple[Optional[int], bytes]]:
+    """
+    Extract possible (dc_id, auth_key) pairs.
 
-    if len(raw) == 256:            # A) bare auth_key -- no DC info at all
-        out.append((None, raw))
+    None means the input does not explicitly contain a DC.
+    """
 
-    elif len(raw) == 257:          # B) 1-byte dc + 256-byte key
+    candidates: list[tuple[Optional[int], bytes]] = []
+
+    # ---------------------------------------------------------
+    # A: bare 256-byte auth key
+    # ---------------------------------------------------------
+    if len(raw) == 256:
+        candidates.append((None, raw))
+
+    # ---------------------------------------------------------
+    # B: 1-byte DC + 256-byte auth key
+    # ---------------------------------------------------------
+    elif len(raw) == 257:
         dc = raw[0]
-        out.append((dc if dc in DC_IPV4 else None, raw[1:]))
 
-    elif len(raw) == 258:          # E) 2-byte dc + 256-byte key
-        for endian in ("big", "little"):
+        if dc in DC_IPV4:
+            candidates.append((dc, raw[1:]))
+        else:
+            candidates.append((None, raw[1:]))
+
+    # ---------------------------------------------------------
+    # C: 2-byte DC + 256-byte auth key
+    # ---------------------------------------------------------
+    elif len(raw) == 258:
+        for endian in ("little", "big"):
             dc = int.from_bytes(raw[:2], endian)
-            if dc in DC_IPV4:
-                out.append((dc, raw[2:]))
-        if not out:
-            out.append((None, raw[2:]))
 
-    elif len(raw) == 260:          # C) 4-byte dc + 256-byte key
-        for endian in ("big", "little"):
+            if dc in DC_IPV4:
+                candidates.append((dc, raw[2:]))
+
+        if not candidates:
+            candidates.append((None, raw[2:]))
+
+    # ---------------------------------------------------------
+    # D: 4-byte DC + 256-byte auth key
+    # ---------------------------------------------------------
+    elif len(raw) == 260:
+        for endian in ("little", "big"):
             dc = int.from_bytes(raw[:4], endian)
+
             if dc in DC_IPV4:
-                out.append((dc, raw[4:]))
-        if not out:
-            out.append((None, raw[4:]))
+                candidates.append((dc, raw[4:]))
 
-    elif len(raw) == 261:          # D) Pyrogram raw: dc LE + test_mode + key
+        if not candidates:
+            candidates.append((None, raw[4:]))
+
+    # ---------------------------------------------------------
+    # E: 4-byte DC + 1-byte test mode + 256-byte auth key
+    # ---------------------------------------------------------
+    elif len(raw) == 261:
         dc = int.from_bytes(raw[:4], "little")
-        out.append((dc if dc in DC_IPV4 else None, raw[5:]))
 
-    elif len(raw) == 264:          # F) auth_key_id(8 LE) + 256-byte key
-        out.append((None, raw[8:]))
+        if dc in DC_IPV4:
+            candidates.append((dc, raw[5:]))
+        else:
+            candidates.append((None, raw[5:]))
 
     else:
         raise ValueError(
-            f"Unsupported hex length {len(raw)} bytes "
-            f"({len(raw) * 2} hex chars). Expected 256/257/258/260/261/264."
+            f"Unsupported hex size: {len(raw)} bytes "
+            f"({len(raw) * 2} hex characters). "
+            "Expected 256/257/258/260/261 bytes."
         )
 
-    return out
+    # Remove duplicate candidates
+    unique = []
+    seen = set()
+
+    for dc, key in candidates:
+        marker = (dc, key)
+
+        if marker not in seen:
+            seen.add(marker)
+            unique.append((dc, key))
+
+    return unique
 
 
-async def _authorized(session_str: str) -> tuple[str | None, str]:
-    """Connect with a candidate string. Returns (saved_string, reason)."""
-    client = TelegramClient(StringSession(session_str), API_ID, API_HASH, proxy=PROXY)
+async def _verify_dc(
+    session_string: str,
+    dc_id: int,
+) -> Optional[str]:
+    """
+    Connect to one DC and verify authorization.
+    """
+
+    client = TelegramClient(
+        StringSession(session_string),
+        API_ID,
+        API_HASH,
+    )
+
     try:
-        await asyncio.wait_for(client.connect(), timeout=PROBE_TIMEOUT)
-        if not await client.is_user_authorized():
-            return None, "server rejected the auth key (AUTH_KEY_UNREGISTERED)"
+        log.info("Checking Telegram DC%d...", dc_id)
 
-        # Stronger check: confirm a real user is actually bound to the key.
-        try:
-            me = await asyncio.wait_for(client.get_me(), timeout=PROBE_TIMEOUT)
-        except telethon.errors.AuthKeyUnregisteredError:
-            return None, "AUTH_KEY_UNREGISTERED (wrong DC or dead key)"
-        if me is None:
-            return None, "auth key registered but no user bound (useless session)"
+        await asyncio.wait_for(
+            client.connect(),
+            timeout=15,
+        )
 
-        saved = client.session.save() or session_str
-        return saved, f"authorized (user {me.id})"
+        authorized = await client.is_user_authorized()
+
+        if not authorized:
+            log.warning(
+                "DC%d connected, but the session is NOT authorized",
+                dc_id,
+            )
+            return None
+
+        log.info(
+            "SUCCESS: auth_key is authorized on DC%d",
+            dc_id,
+        )
+
+        # Save after connection in case Telethon migrated
+        # the session to another DC.
+        saved = client.session.save()
+
+        return saved or session_string
+
     except asyncio.TimeoutError:
-        return None, "connect timed out (no route to Telegram - proxy needed?)"
-    except telethon.errors.AuthKeyUnregisteredError:
-        return None, "AUTH_KEY_UNREGISTERED (wrong DC or dead key)"
-    except telethon.errors.ApiIdInvalidError:
-        return None, f"API_ID={API_ID} / API_HASH invalid or banned"
+        log.warning(
+            "DC%d timed out",
+            dc_id,
+        )
+
     except Exception as exc:
-        return None, f"{type(exc).__name__}: {exc}"
+        log.warning(
+            "DC%d verification failed: %s: %s",
+            dc_id,
+            type(exc).__name__,
+            exc,
+        )
+
     finally:
         try:
             await client.disconnect()
         except Exception:
             pass
 
+    return None
 
-async def _probe(auth_key: bytes, dc_hint: int | None = None) -> str:
-    """Try the hinted DC first, then the rest. Collect a reason for every DC."""
-    order = list(DC_IPV4)
+
+async def _probe(
+    auth_key: bytes,
+    dc_hint: Optional[int] = None,
+) -> str:
+    """
+    Verify the auth key.
+
+    If DC is known, check that DC first.
+
+    If the key is bare and contains no DC information,
+    check the production DCs sequentially.
+    """
+
+    if len(auth_key) != 256:
+        raise ValueError(
+            f"Invalid auth_key length: {len(auth_key)}"
+        )
+
+    # ---------------------------------------------------------
+    # If the panel supplied a DC, don't blindly scan everything.
+    # ---------------------------------------------------------
     if dc_hint in DC_IPV4:
-        order.remove(dc_hint)
-        order.insert(0, dc_hint)
+        order = [dc_hint]
+    else:
+        order = list(DC_IPV4.keys())
 
-    reasons: list[str] = []
-    for dc in order:
+    errors = []
+
+    for dc_id in order:
+
+        log.info(
+            "Building session for DC%d...",
+            dc_id,
+        )
+
         try:
-            candidate = make_string(dc, auth_key)
+            candidate = make_string(
+                dc_id,
+                auth_key,
+            )
         except Exception as exc:
-            reasons.append(f"DC{dc}: encode failed ({exc})")
+            errors.append(
+                f"DC{dc_id}: {exc}"
+            )
             continue
-        saved, reason = await _authorized(candidate)
+
+        saved = await _verify_dc(
+            candidate,
+            dc_id,
+        )
+
         if saved:
-            log.info("auth_key authorized on DC%d (%s)", dc, reason)
             return saved
-        reasons.append(f"DC{dc}: {reason}")
 
     raise ValueError(
-        "Could not authorize this hex on any Telegram DC (1-5).\n"
-        "Per-DC results:\n  " + "\n  ".join(reasons) + "\n"
-        "Note: a bare 256-byte key has no DC info, so all 5 DCs must be probed.\n"
-        "If every DC fails with timeouts/connection errors, the host cannot reach\n"
-        "Telegram directly - set PROXY (or run the verifier on a host with access)."
+        "Auth key could not be verified. "
+        + " | ".join(errors)
     )
 
 
-async def hex_to_session_string(raw_input: str) -> str:
-    """Accept a Telethon string OR a panel hex. Always return a working StringSession."""
+async def hex_to_session_string(
+    raw_input: str,
+) -> str:
+    """
+    Convert either:
+
+        Telethon StringSession
+        OR
+        hexadecimal panel session
+
+    into an authorized Telethon StringSession.
+    """
+
     raw_input = (raw_input or "").strip()
+
     if not raw_input:
         raise ValueError("Empty session input")
 
+    # ---------------------------------------------------------
+    # Cache
+    # ---------------------------------------------------------
+
     if raw_input in _cache:
         return _cache[raw_input]
+
+    # ---------------------------------------------------------
+    # Already a Telethon StringSession
+    # ---------------------------------------------------------
 
     if _looks_like_telethon(raw_input):
         _cache[raw_input] = raw_input
         return raw_input
 
-    # Some panels wrap the Telethon string as hex(utf8(string))
+    # ---------------------------------------------------------
+    # Hex input
+    # ---------------------------------------------------------
+
     if _is_hex(raw_input):
+
         raw = bytes.fromhex(raw_input)
+
+        # -----------------------------------------------------
+        # First possibility:
+        # hex(UTF-8 Telethon StringSession)
+        # -----------------------------------------------------
+
         try:
-            as_text = raw.decode("ascii", errors="strict")
-            if _looks_like_telethon(as_text):
-                _cache[raw_input] = as_text
-                return as_text
-        except (ValueError, UnicodeDecodeError):
+            decoded = raw.decode("ascii")
+
+            if _looks_like_telethon(decoded):
+                _cache[raw_input] = decoded
+                return decoded
+
+        except UnicodeDecodeError:
             pass
 
-        key_candidates = _extract_keys(raw)
-        last_err: Exception | None = None
-        for dc_hint, key in key_candidates:
+        # -----------------------------------------------------
+        # Panel auth-key formats
+        # -----------------------------------------------------
+
+        candidates = _extract_candidates(raw)
+
+        last_error: Optional[Exception] = None
+
+        for dc_hint, auth_key in candidates:
+
             try:
-                saved = await _probe(key, dc_hint)
-                _cache[raw_input] = saved
-                return saved
+                session = await _probe(
+                    auth_key,
+                    dc_hint,
+                )
+
+                _cache[raw_input] = session
+
+                return session
+
             except Exception as exc:
-                last_err = exc
-        raise last_err or ValueError("Unsupported hex format")
+                last_error = exc
 
-    # Hex-looking but invalid -> say exactly why (e.g. odd length)
-    stripped = raw_input.strip()
-    if all(c in "0123456789abcdefABCDEF" for c in stripped):
-        raise ValueError(_bad_hex_reason(stripped))
+                log.warning(
+                    "Candidate verification failed: %s",
+                    exc,
+                )
 
-    # Last chance: maybe it's a Telethon string that decode() is picky about
+        raise last_error or ValueError(
+            "Unable to verify hexadecimal session"
+        )
+
+    # ---------------------------------------------------------
+    # Final Telethon parser attempt
+    # ---------------------------------------------------------
+
     try:
         StringSession(raw_input)
+
         _cache[raw_input] = raw_input
+
         return raw_input
+
     except Exception:
         raise ValueError(
-            "Input is neither a Telethon StringSession nor a hex auth_key"
+            "Input is neither a valid Telethon StringSession "
+            "nor a supported hexadecimal auth-key format."
         ) from None
