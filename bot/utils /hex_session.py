@@ -279,9 +279,8 @@ def _extract_from_hex(raw: bytes) -> list[tuple[Optional[int], bytes, Optional[b
 
     return out
 
-
 def _build_string(dc: int, key: bytes, packed: Optional[bytes]) -> str:
-    if packed in (263, 275) or (packed is not None and len(packed) in (263, 275)):
+    if packed is not None and len(packed) in (263, 275):
         return _telethon_string_from_packed(packed)
     return make_string(dc, key)
 
