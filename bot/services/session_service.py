@@ -26,9 +26,13 @@ async def get_session_string(raw: str) -> str:
     _SESSION_CACHE[raw] = converted
     return converted
 
-
 async def make_client(raw: str) -> TelegramClient:
     session_string = await get_session_string(raw)
+    if not session_string or not session_string.startswith("1"):
+        raise ValueError(
+            "Session conversion produced an invalid Telethon string. "
+            "The hex format is not supported or conversion failed."
+        )
     return TelegramClient(StringSession(session_string), API_ID, API_HASH)
 
 
@@ -38,12 +42,13 @@ async def _connect(client: TelegramClient) -> None:
     try:
         authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=10)
     except Exception as exc:
-        raise ValueError(f"Could not check authorization: {type(exc).__name__}: {exc}") from exc
+        raise ValueError(f"Authorization check failed: {type(exc).__name__}: {exc}") from exc
     if not authorized:
         raise ValueError(
-            "Session is not authorized. "
-            "The auth key is dead, on the wrong DC, or the format was misread."
+            "Connected, but Telegram rejected the auth key "
+            "(dead / revoked / wrong DC)."
         )
+    
 
 
 async def verify(raw: str) -> tuple[dict, TelegramClient]:
