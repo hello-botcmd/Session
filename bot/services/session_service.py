@@ -8,10 +8,9 @@ import re
 from datetime import datetime, timezone
 
 from telethon import TelegramClient
-from telethon.sessions import StringSession
 from telethon.tl import functions, types
 
-from bot.utils.hex_session import hex_to_session_string
+from bot.utils.hex_session import connect_from_raw, hex_to_session_string
 from config import API_HASH, API_ID
 
 OTP_RE = re.compile(r"\b(\d{5,6})\b")
@@ -23,20 +22,23 @@ async def get_session_string(raw: str) -> str:
     if raw in _SESSION_CACHE:
         return _SESSION_CACHE[raw]
     converted = await hex_to_session_string(raw)
-    _SESSION_CACHE[raw] = converted
+    # Only remember strings that the converter marked as deterministic
+    # (already in hex_session._cache). Guessed DC-2 strings are not stored.
+    from bot.utils import hex_session as _hs
+    cleaned = _hs._clean(raw)
+    if cleaned in _hs._cache:
+        _SESSION_CACHE[raw] = _hs._cache[cleaned]
+        return _SESSION_CACHE[raw]
     return converted
 
+
 async def make_client(raw: str) -> TelegramClient:
-    session_string = await get_session_string(raw)
-    if not session_string or not session_string.startswith("1"):
-        raise ValueError(
-            "Session conversion produced an invalid Telethon string. "
-            "The hex format is not supported or conversion failed."
-        )
-    return TelegramClient(StringSession(session_string), API_ID, API_HASH)
+    """Return a LIVE authorized client. Do not connect again."""
+    return await connect_from_raw(raw)
 
 
 async def _connect(client: TelegramClient) -> None:
+    """Idempotent. Safe if make_client() already authorized the client."""
     if not client.is_connected():
         await asyncio.wait_for(client.connect(), timeout=15)
     try:
@@ -48,51 +50,57 @@ async def _connect(client: TelegramClient) -> None:
             "Connected, but Telegram rejected the auth key "
             "(dead / revoked / wrong DC)."
         )
-    
 
 
 async def verify(raw: str) -> tuple[dict, TelegramClient]:
-    """Convert hex, connect, pull account info. Caller must disconnect client."""
+    """One connect. Caller must disconnect the client."""
     client = await make_client(raw)
-    await _connect(client)
-
-    me = await client.get_me()
-    if me is None:
-        await client.disconnect()
-        raise ValueError("get_me() returned None — session is dead")
-
-    name = " ".join(p for p in (me.first_name, me.last_name) if p).strip() or "Unknown"
-    phone = me.phone or "hidden"
-
-    devices = []
     try:
-        auths = await client(functions.account.GetAuthorizationsRequest())
-        for a in auths.authorizations:
-            devices.append({
-                "hash": a.hash,
-                "current": bool(a.current),
-                "device": a.device_model or "Unknown",
-                "app": a.app_name or "",
-                "platform": a.platform or "",
-                "ip": a.ip or "",
-                "country": a.country or "",
-                "date": getattr(a, "date_active", None) or getattr(a, "date_created", None),
-            })
-    except Exception:
+        me = await client.get_me()
+        if me is None:
+            raise ValueError("get_me() returned None — session is dead")
+
+        name = " ".join(p for p in (me.first_name, me.last_name) if p).strip() or "Unknown"
+        phone = me.phone or "hidden"
+
         devices = []
+        try:
+            auths = await client(functions.account.GetAuthorizationsRequest())
+            for a in auths.authorizations:
+                devices.append({
+                    "hash": a.hash,
+                    "current": bool(a.current),
+                    "device": a.device_model or "Unknown",
+                    "app": a.app_name or "",
+                    "platform": a.platform or "",
+                    "ip": a.ip or "",
+                    "country": a.country or "",
+                    "date": getattr(a, "date_active", None) or getattr(a, "date_created", None),
+                })
+        except Exception:
+            devices = []
 
-    spam = await _spam_status(client)
+        spam = await _spam_status(client)
+        session_string = client.session.save()
+        if session_string:
+            _SESSION_CACHE[(raw or "").strip()] = session_string
 
-    info = {
-        "phone": phone,
-        "name": name,
-        "user_id": me.id,
-        "username": me.username or "",
-        "spam": spam,
-        "devices": devices,
-        "session_string": await get_session_string(raw),
-    }
-    return info, client
+        info = {
+            "phone": phone,
+            "name": name,
+            "user_id": me.id,
+            "username": me.username or "",
+            "spam": spam,
+            "devices": devices,
+            "session_string": session_string,
+        }
+        return info, client
+    except Exception:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        raise
 
 
 async def _spam_status(client: TelegramClient) -> str:
