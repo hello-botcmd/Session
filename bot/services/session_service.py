@@ -1,279 +1,254 @@
+"""Telegram session operations used by Manage / Guard / My Accounts."""
+
+from __future__ import annotations
+
+import asyncio
 import imaplib
 import re
-import time
+from datetime import datetime, timezone
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl import functions
+from telethon.tl import functions, types
 
-from bot.services.account_service import AccountService
 from bot.utils.hex_session import hex_to_session_string
 from config import API_HASH, API_ID
 
-
-OTP_RE = re.compile(r"(?:code|otp|verification)[^\d]{0,30}?(\d{5,6})", re.I)
-CODE_RE = re.compile(r"\b\d{5,6}\b")
-
-
-# ---------------------------------------------------------------- connection
-_session_string_cache = {}
+OTP_RE = re.compile(r"\b(\d{5,6})\b")
+_SESSION_CACHE: dict[str, str] = {}
 
 
-async def get_session_string(hex_str: str) -> str:
-    """Converted session string, with Mongo as a persistent cache
-    (so DC discovery only runs once per account)."""
-    hex_str = hex_str.strip()
-    if hex_str in _session_string_cache:
-        return _session_string_cache[hex_str]
-    acc = AccountService().get(hex_str)
-    if acc and acc.get("session_string"):
-        _session_string_cache[hex_str] = acc["session_string"]
-        return acc["session_string"]
-    s = await hex_to_session_string(hex_str)
-    _session_string_cache[hex_str] = s
-    return s
+async def get_session_string(raw: str) -> str:
+    raw = (raw or "").strip()
+    if raw in _SESSION_CACHE:
+        return _SESSION_CACHE[raw]
+    converted = await hex_to_session_string(raw)
+    _SESSION_CACHE[raw] = converted
+    return converted
 
 
-async def make_client(hex_str: str) -> TelegramClient:
-    session_string = await get_session_string(hex_str)
-    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-    await client.connect()
+async def make_client(raw: str) -> TelegramClient:
+    session_string = await get_session_string(raw)
+    return TelegramClient(StringSession(session_string), API_ID, API_HASH)
+
+
+async def _connect(client: TelegramClient) -> None:
+    if not client.is_connected():
+        await asyncio.wait_for(client.connect(), timeout=15)
     if not await client.is_user_authorized():
-        raise ValueError("Session is expired, revoked or invalid")
-    return client
+        raise ValueError("Session is expired, revoked, or not authorized")
 
 
-async def account_summary(client: TelegramClient) -> dict:
-    """Fetch phone, name, user id, device count and spam status."""
+async def verify(raw: str) -> tuple[dict, TelegramClient]:
+    """Convert hex, connect, pull account info. Caller must disconnect client."""
+    client = await make_client(raw)
+    await _connect(client)
+
     me = await client.get_me()
+    if me is None:
+        await client.disconnect()
+        raise ValueError("get_me() returned None — session is dead")
+
+    name = " ".join(p for p in (me.first_name, me.last_name) if p).strip() or "Unknown"
+    phone = me.phone or "hidden"
+
     devices = []
     try:
-        res = await client(functions.account.GetAuthorizationsRequest())
-        devices = res.authorizations
+        auths = await client(functions.account.GetAuthorizationsRequest())
+        for a in auths.authorizations:
+            devices.append({
+                "hash": a.hash,
+                "current": bool(a.current),
+                "device": a.device_model or "Unknown",
+                "app": a.app_name or "",
+                "platform": a.platform or "",
+                "ip": a.ip or "",
+                "country": a.country or "",
+                "date": getattr(a, "date_active", None) or getattr(a, "date_created", None),
+            })
+    except Exception:
+        devices = []
+
+    spam = await _spam_status(client)
+
+    info = {
+        "phone": phone,
+        "name": name,
+        "user_id": me.id,
+        "username": me.username or "",
+        "spam": spam,
+        "devices": devices,
+        "session_string": await get_session_string(raw),
+    }
+    return info, client
+
+
+async def _spam_status(client: TelegramClient) -> str:
+    """Best-effort restriction check. Telegram has no public 'spam' flag."""
+    try:
+        me = await client.get_me()
+        if getattr(me, "restricted", False):
+            return "restricted"
+        if getattr(me, "restriction_reason", None):
+            return "restricted"
     except Exception:
         pass
-    return {
-        "phone": me.phone,
-        "name": f"{me.first_name or ''} {me.last_name or ''}".strip() or "Unknown",
-        "user_id": me.id,
-        "devices": len(devices),
-        "spam": "Spam" if getattr(me, "restricted", False) else "Non-Spam",
-    }
-
-
-async def verify(hex_str: str):
-    """Verify a hex + run a spam check. Returns (info_dict, connected_client)."""
-    client = await make_client(hex_str)
     try:
-        info = await account_summary(client)
-        spam = info["spam"] == "Spam"
+        await client.send_message("me", "🛡️ session-manager probe")
+        return "clean"
+    except Exception as exc:
+        text = str(exc).lower()
+        if "banned" in text or "deactivated" in text:
+            return "banned"
+        if "spam" in text or "restricted" in text or "peer_flood" in text:
+            return "restricted"
+        return "unknown"
 
-        # Restricted accounts usually fail even GetAccountTtl
+
+async def list_devices(client: TelegramClient) -> list[dict]:
+    await _connect(client)
+    auths = await client(functions.account.GetAuthorizationsRequest())
+    out = []
+    for a in auths.authorizations:
+        out.append({
+            "hash": a.hash,
+            "current": bool(a.current),
+            "device": a.device_model or "Unknown",
+            "app": a.app_name or "",
+            "platform": a.platform or "",
+            "ip": a.ip or "",
+            "country": a.country or "",
+            "date": getattr(a, "date_active", None) or getattr(a, "date_created", None),
+        })
+    return out
+
+
+async def terminate_hash(client: TelegramClient, auth_hash: int) -> None:
+    await _connect(client)
+    await client(functions.account.ResetAuthorizationRequest(hash=auth_hash))
+
+
+async def terminate_all_others(client: TelegramClient) -> int:
+    """Kick every session except the one this client is using. Returns count."""
+    devices = await list_devices(client)
+    removed = 0
+    for d in devices:
+        if d["current"] or not d["hash"]:
+            continue
         try:
-            await client(functions.account.GetAccountTtlRequest())
-        except Exception:
-            spam = True
-
-        # Probe: a truly restricted account can't even message Saved Messages
-        if not spam:
-            try:
-                msg = await client.send_message("me", ".")
-                spam = False
-                try:
-                    await client.delete_messages("me", [msg.id])
-                except Exception:
-                    pass
-            except Exception:
-                spam = True
-
-        info["spam"] = "Spam" if spam else "Non-Spam"
-        return info, client
-    except Exception:
-        await client.disconnect()
-        raise
-
-
-# ------------------------------------------------------------------- devices
-async def list_devices(client: TelegramClient):
-    res = await client(functions.account.GetAuthorizationsRequest())
-    return res.authorizations
-
-
-async def terminate_device(client: TelegramClient, hash_: int):
-    await client(functions.account.DeleteAuthorizationsRequest(hashes=[hash_]))
-
-
-async def revoke_session(client: TelegramClient):
-    """Log out this session permanently."""
-    try:
-        await client.log_out()
-    finally:
-        try:
-            await client.disconnect()
+            await terminate_hash(client, d["hash"])
+            removed += 1
         except Exception:
             pass
+    return removed
 
 
-# ------------------------------------------------------------------ clear all
-async def clear_all(client: TelegramClient, progress=None) -> dict:
-    """Wipe contacts, DMs, groups and channels from the account."""
-    stats = {"contacts": 0, "dialogs": 0, "groups": 0, "channels": 0}
-
-    # 1) Contacts
-    if progress:
-        await progress("contacts")
-    try:
-        contacts = await client(functions.contacts.GetContactsRequest(hash=0))
-        for u in contacts.users:
-            try:
-                await client(functions.contacts.DeleteContactsRequest(id=[u.id]))
-                stats["contacts"] += 1
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    # 2) Everything else
-    if progress:
-        await progress("dialogs")
-    async for dialog in client.iter_dialogs():
-        if dialog.is_self:  # never touch Saved Messages
-            continue
-        try:
-            if dialog.is_user:
-                await client(
-                    functions.messages.DeleteHistoryRequest(
-                        peer=dialog.id, revoke=True, max_id=0
-                    )
-                )
-                stats["dialogs"] += 1
-            elif dialog.is_group:
-                try:
-                    await client(
-                        functions.messages.DeleteChatRequest(chat_id=abs(dialog.id))
-                    )
-                except Exception:
-                    try:
-                        await client(functions.channels.LeaveChannelRequest(dialog.entity))
-                    except Exception:
-                        try:
-                            await client(
-                                functions.messages.DeleteChatUserRequest(
-                                    chat_id=abs(dialog.id), user_id="me"
-                                )
-                            )
-                        except Exception:
-                            pass
-                stats["groups"] += 1
-            elif dialog.is_channel:
-                try:
-                    await client(functions.channels.DeleteChannelRequest(dialog.entity))
-                except Exception:
-                    try:
-                        await client(functions.channels.LeaveChannelRequest(dialog.entity))
-                    except Exception:
-                        pass
-                stats["channels"] += 1
-        except Exception:
-            continue
-    return stats
+async def reset_authorizations(client: TelegramClient) -> None:
+    """Revoke EVERY session including this one. Client dies after this."""
+    await _connect(client)
+    await client(functions.auth.ResetAuthorizationsRequest())
 
 
-# ------------------------------------------------------------------------ OTP
-async def read_otp(client: TelegramClient, limit_dialogs: int = 15, limit_msgs: int = 40):
-    """Scan recent chats for the latest Telegram login code."""
-    found = []
-    try:
-        async for dialog in client.iter_dialogs(limit=limit_dialogs):
-            try:
-                async for msg in client.iter_messages(dialog.id, limit=limit_msgs):
-                    if not msg.message:
-                        continue
+async def fetch_otp(client: TelegramClient, timeout: int = 25) -> str | None:
+    """Read the latest Telegram login code from 777000 / recent dialogs."""
+    await _connect(client)
+
+    async def _scan() -> str | None:
+        async for msg in client.iter_messages(777000, limit=8):
+            if not msg or not msg.message:
+                continue
+            m = OTP_RE.search(msg.message)
+            if m:
+                return m.group(1)
+        async for dialog in client.iter_dialogs(limit=15):
+            if dialog.id == 777000:
+                continue
+            async for msg in client.iter_messages(dialog.id, limit=3):
+                if not msg or not msg.message:
+                    continue
+                if "login code" in msg.message.lower() or "код" in msg.message.lower():
                     m = OTP_RE.search(msg.message)
                     if m:
-                        found.append(
-                            (msg.date, m.group(1), dialog.name or str(dialog.id))
-                        )
-                        break
-            except Exception:
-                continue
-    except Exception:
-        pass
-    if not found:
-        return None
-    found.sort(key=lambda x: x[0], reverse=True)
-    return found[0]
-
-
-# ------------------------------------------------------------------ change email
-def _imap_host(email: str):
-    domain = email.split("@")[-1].lower()
-    return {
-        "gmail.com": "imap.gmail.com",
-        "outlook.com": "outlook.office365.com",
-        "hotmail.com": "outlook.office365.com",
-        "yahoo.com": "imap.mail.yahoo.com",
-    }.get(domain)
-
-
-def _read_email_code(email: str, app_password: str, attempts: int = 6, delay: int = 5):
-    """Fetch the verification code from the new email inbox via IMAP."""
-    host = _imap_host(email)
-    if not host:
-        return None
-    for _ in range(attempts):
-        try:
-            conn = imaplib.IMAP4_SSL(host)
-            conn.login(email, app_password)
-            conn.select("INBOX")
-            status, data = conn.search(None, "ALL")
-            if status == "OK":
-                ids = data[0].split()[-5:]
-                for i in reversed(ids):
-                    _, msg_data = conn.fetch(i, "(BODY.PEEK[TEXT])")
-                    body = msg_data[0][1].decode(errors="ignore")
-                    m = CODE_RE.search(body)
-                    if m:
-                        conn.logout()
                         return m.group(1)
-            conn.logout()
-        except Exception:
-            pass
-        time.sleep(delay)
+        return None
+
+    code = await _scan()
+    if code:
+        return code
+
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(2)
+        code = await _scan()
+        if code:
+            return code
     return None
 
 
-async def change_email(client: TelegramClient, email: str, app_password: str = None):
-    """Change the account's login email (verify-code flow)."""
-    try:
-        from telethon.tl.functions.account import (  # layer 158+
-            SendVerifyEmailCodeRequest,
-            VerifyEmailRequest,
-        )
-    except ImportError:
-        raise RuntimeError(
-            "Your Telethon version doesn't support the email API. "
-            "Upgrade: pip install -U telethon"
-        )
+async def change_email(client: TelegramClient, email: str, app_password: str) -> None:
+    """Best-effort login-email change via Telegram + IMAP inbox for the code."""
+    await _connect(client)
+    if not email or not app_password:
+        raise ValueError("GUARD_EMAIL / GUARD_EMAIL_APP_PASSWORD not configured")
 
-    try:
-        await client(SendVerifyEmailCodeRequest(email=email))
-    except Exception as e:
-        raise RuntimeError(f"Failed to send verification code: {e}")
+    sent = await client(functions.account.SendVerifyEmailCodeRequest(
+        purpose=types.EmailVerifyPurposeLoginChange(),
+        email=email,
+    ))
+    code = await _wait_imap_code(email, app_password, timeout=90)
+    if not code:
+        raise ValueError(f"No verification code arrived in {email}")
 
-    code = _read_email_code(email, app_password) if app_password else None
-    if not code:  # fallback: code might arrive as a Telegram message
+    await client(functions.account.VerifyEmailRequest(
+        purpose=types.EmailVerifyPurposeLoginChange(),
+        verification=types.EmailVerificationCode(code=code),
+    ))
+    return sent
+
+
+async def _wait_imap_code(email: str, app_password: str, timeout: int = 90) -> str | None:
+    host = "imap.gmail.com"
+    domain = email.rsplit("@", 1)[-1].lower()
+    if domain in {"outlook.com", "hotmail.com", "live.com"}:
+        host = "outlook.office365.com"
+    elif domain in {"yahoo.com", "ymail.com"}:
+        host = "imap.mail.yahoo.com"
+
+    deadline = asyncio.get_event_loop().time() + timeout
+    seen: set[bytes] = set()
+
+    while asyncio.get_event_loop().time() < deadline:
         try:
-            otp = await read_otp(client)
-            if otp:
-                code = otp[1]
+            mail = imaplib.IMAP4_SSL(host, 993)
+            mail.login(email, app_password)
+            mail.select("INBOX")
+            _, data = mail.search(None, "UNSEEN")
+            ids = data[0].split() if data and data[0] else []
+            for mid in reversed(ids[-10:]):
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                _, msg_data = mail.fetch(mid, "(RFC822)")
+                body = msg_data[0][1]
+                if not body:
+                    continue
+                text = body.decode("utf-8", errors="ignore")
+                m = OTP_RE.search(text)
+                if m and ("telegram" in text.lower() or "verify" in text.lower()):
+                    mail.logout()
+                    return m.group(1)
+            mail.logout()
         except Exception:
             pass
-    if not code:
-        raise RuntimeError("Could not read the verification code automatically.")
+        await asyncio.sleep(4)
+    return None
 
-    try:
-        await client(VerifyEmailRequest(email=email, code=code))
-    except Exception as e:
-        raise RuntimeError(f"Email verification failed: {e}")
-    return True
+
+def fmt_when(dt) -> str:
+    if not dt:
+        return "?"
+    if isinstance(dt, datetime):
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return str(dt)
