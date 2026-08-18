@@ -1,5 +1,3 @@
-"""Telegram session operations used by Manage / Guard / My Accounts."""
-
 from __future__ import annotations
 
 import asyncio
@@ -8,13 +6,19 @@ import re
 from datetime import datetime, timezone
 
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError
 from telethon.tl import functions, types
 
 from bot.utils.hex_session import connect_from_raw, hex_to_session_string
 from config import API_HASH, API_ID
 
 OTP_RE = re.compile(r"\b(\d{5,6})\b")
+SPAMBOT = 178220800
 _SESSION_CACHE: dict[str, str] = {}
+
+
+async def _sleep_flood(exc: FloodWaitError) -> None:
+    await asyncio.sleep(int(getattr(exc, "seconds", 1)) + 1)
 
 
 async def get_session_string(raw: str) -> str:
@@ -22,9 +26,8 @@ async def get_session_string(raw: str) -> str:
     if raw in _SESSION_CACHE:
         return _SESSION_CACHE[raw]
     converted = await hex_to_session_string(raw)
-    # Only remember strings that the converter marked as deterministic
-    # (already in hex_session._cache). Guessed DC-2 strings are not stored.
     from bot.utils import hex_session as _hs
+
     cleaned = _hs._clean(raw)
     if cleaned in _hs._cache:
         _SESSION_CACHE[raw] = _hs._cache[cleaned]
@@ -33,12 +36,10 @@ async def get_session_string(raw: str) -> str:
 
 
 async def make_client(raw: str) -> TelegramClient:
-    """Return a LIVE authorized client. Do not connect again."""
     return await connect_from_raw(raw)
 
 
 async def _connect(client: TelegramClient) -> None:
-    """Idempotent. Safe if make_client() already authorized the client."""
     if not client.is_connected():
         await asyncio.wait_for(client.connect(), timeout=15)
     try:
@@ -46,54 +47,112 @@ async def _connect(client: TelegramClient) -> None:
     except Exception as exc:
         raise ValueError(f"Authorization check failed: {type(exc).__name__}: {exc}") from exc
     if not authorized:
-        raise ValueError(
-            "Connected, but Telegram rejected the auth key "
-            "(dead / revoked / wrong DC)."
-        )
+        raise ValueError("Connected, but Telegram rejected the auth key (dead / revoked / wrong DC).")
+
+
+def _auth_to_dict(a) -> dict:
+    return {
+        "hash": a.hash,
+        "current": bool(a.current),
+        "device": a.device_model or "Unknown",
+        "app": a.app_name or "",
+        "app_version": a.app_version or "",
+        "platform": a.platform or "",
+        "ip": a.ip or "",
+        "country": a.country or "",
+        "region": getattr(a, "region", "") or "",
+        "date": getattr(a, "date_active", None) or getattr(a, "date_created", None),
+        "date_active": getattr(a, "date_active", None),
+        "date_created": getattr(a, "date_created", None),
+    }
+
+
+async def list_devices(client: TelegramClient) -> list[dict]:
+    await _connect(client)
+    try:
+        auths = await client(functions.account.GetAuthorizationsRequest())
+    except FloodWaitError as exc:
+        await _sleep_flood(exc)
+        auths = await client(functions.account.GetAuthorizationsRequest())
+    return [_auth_to_dict(a) for a in auths.authorizations]
+
+
+async def account_summary(client: TelegramClient) -> dict:
+    await _connect(client)
+    me = await client.get_me()
+    if me is None:
+        raise ValueError("get_me() returned None — session is dead")
+    name = " ".join(p for p in (me.first_name, me.last_name) if p).strip() or "Unknown"
+    devices = []
+    try:
+        devices = await list_devices(client)
+    except Exception:
+        devices = []
+    return {
+        "phone": me.phone or "hidden",
+        "name": name,
+        "user_id": me.id,
+        "username": me.username or "",
+        "devices": devices,
+        "device_count": len(devices),
+        "spam": "",
+        "spam_detail": "",
+        "session_string": client.session.save() if client.session else "",
+    }
+
+
+async def spam_status(client: TelegramClient) -> tuple[str, str]:
+    """Ask @SpamBot. Never probe by messaging Saved Messages."""
+    await _connect(client)
+    try:
+        await client.send_message(SPAMBOT, "/start")
+    except FloodWaitError as exc:
+        await _sleep_flood(exc)
+        await client.send_message(SPAMBOT, "/start")
+    except Exception as exc:
+        return "Unknown", f"Could not reach SpamBot: {exc}"
+
+    deadline = asyncio.get_running_loop().time() + 12
+    last = ""
+    while asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(1.2)
+        try:
+            async for msg in client.iter_messages(SPAMBOT, limit=6):
+                if not msg or msg.out or not msg.message:
+                    continue
+                last = msg.message.strip()
+                break
+        except Exception:
+            continue
+        if last:
+            break
+
+    if not last:
+        return "Unknown", "SpamBot did not reply in time."
+
+    low = last.lower()
+    if "good news" in low or "no limits" in low:
+        short = "Clean"
+    elif "banned" in low or "deactivated" in low:
+        short = "Banned"
+    elif "limited" in low or "restrict" in low or "spam" in low:
+        short = "Restricted"
+    else:
+        short = "See details"
+    return short, last
 
 
 async def verify(raw: str) -> tuple[dict, TelegramClient]:
-    """One connect. Caller must disconnect the client."""
     client = await make_client(raw)
     try:
-        me = await client.get_me()
-        if me is None:
-            raise ValueError("get_me() returned None — session is dead")
-
-        name = " ".join(p for p in (me.first_name, me.last_name) if p).strip() or "Unknown"
-        phone = me.phone or "hidden"
-
-        devices = []
+        info = await account_summary(client)
         try:
-            auths = await client(functions.account.GetAuthorizationsRequest())
-            for a in auths.authorizations:
-                devices.append({
-                    "hash": a.hash,
-                    "current": bool(a.current),
-                    "device": a.device_model or "Unknown",
-                    "app": a.app_name or "",
-                    "platform": a.platform or "",
-                    "ip": a.ip or "",
-                    "country": a.country or "",
-                    "date": getattr(a, "date_active", None) or getattr(a, "date_created", None),
-                })
-        except Exception:
-            devices = []
-
-        spam = await _spam_status(client)
-        session_string = client.session.save()
+            info["spam"], info["spam_detail"] = await spam_status(client)
+        except Exception as exc:
+            info["spam"], info["spam_detail"] = "Unknown", str(exc)
+        session_string = info.get("session_string") or ""
         if session_string:
             _SESSION_CACHE[(raw or "").strip()] = session_string
-
-        info = {
-            "phone": phone,
-            "name": name,
-            "user_id": me.id,
-            "username": me.username or "",
-            "spam": spam,
-            "devices": devices,
-            "session_string": session_string,
-        }
         return info, client
     except Exception:
         try:
@@ -103,130 +162,159 @@ async def verify(raw: str) -> tuple[dict, TelegramClient]:
         raise
 
 
-async def _spam_status(client: TelegramClient) -> str:
-    """Best-effort restriction check. Telegram has no public 'spam' flag."""
-    try:
-        me = await client.get_me()
-        if getattr(me, "restricted", False):
-            return "restricted"
-        if getattr(me, "restriction_reason", None):
-            return "restricted"
-    except Exception:
-        pass
-    try:
-        await client.send_message("me", "🛡️ session-manager probe")
-        return "clean"
-    except Exception as exc:
-        text = str(exc).lower()
-        if "banned" in text or "deactivated" in text:
-            return "banned"
-        if "spam" in text or "restricted" in text or "peer_flood" in text:
-            return "restricted"
-        return "unknown"
-
-
-async def list_devices(client: TelegramClient) -> list[dict]:
-    await _connect(client)
-    auths = await client(functions.account.GetAuthorizationsRequest())
-    out = []
-    for a in auths.authorizations:
-        out.append({
-            "hash": a.hash,
-            "current": bool(a.current),
-            "device": a.device_model or "Unknown",
-            "app": a.app_name or "",
-            "platform": a.platform or "",
-            "ip": a.ip or "",
-            "country": a.country or "",
-            "date": getattr(a, "date_active", None) or getattr(a, "date_created", None),
-        })
-    return out
-
-
 async def terminate_hash(client: TelegramClient, auth_hash: int) -> None:
     await _connect(client)
-    await client(functions.account.ResetAuthorizationRequest(hash=auth_hash))
+    await client(functions.account.ResetAuthorizationRequest(hash=int(auth_hash)))
+
+
+async def terminate_device(client: TelegramClient, auth_hash: int) -> None:
+    await terminate_hash(client, auth_hash)
 
 
 async def terminate_all_others(client: TelegramClient) -> int:
-    """Kick every session except the one this client is using. Returns count."""
     devices = await list_devices(client)
     removed = 0
-    for d in devices:
-        if d["current"] or not d["hash"]:
+    for item in devices:
+        if item.get("current") or not item.get("hash"):
             continue
         try:
-            await terminate_hash(client, d["hash"])
+            await terminate_hash(client, item["hash"])
             removed += 1
+        except FloodWaitError as exc:
+            await _sleep_flood(exc)
         except Exception:
             pass
     return removed
 
 
+async def revoke_session(client: TelegramClient) -> None:
+    await _connect(client)
+    await client.log_out()
+
+
 async def reset_authorizations(client: TelegramClient) -> None:
-    """Revoke EVERY session including this one. Client dies after this."""
     await _connect(client)
     await client(functions.auth.ResetAuthorizationsRequest())
 
 
-async def fetch_otp(client: TelegramClient, timeout: int = 25) -> str | None:
-    """Read the latest Telegram login code from 777000 / recent dialogs."""
+async def fetch_otp(client: TelegramClient, timeout: int = 25) -> dict | None:
     await _connect(client)
 
-    async def _scan() -> str | None:
+    async def _scan() -> dict | None:
         async for msg in client.iter_messages(777000, limit=8):
             if not msg or not msg.message:
                 continue
-            m = OTP_RE.search(msg.message)
-            if m:
-                return m.group(1)
+            found = OTP_RE.search(msg.message)
+            if found:
+                return {
+                    "date": msg.date or datetime.now(timezone.utc),
+                    "code": found.group(1),
+                    "chat": "Telegram (777000)",
+                }
         async for dialog in client.iter_dialogs(limit=15):
             if dialog.id == 777000:
                 continue
             async for msg in client.iter_messages(dialog.id, limit=3):
                 if not msg or not msg.message:
                     continue
-                if "login code" in msg.message.lower() or "код" in msg.message.lower():
-                    m = OTP_RE.search(msg.message)
-                    if m:
-                        return m.group(1)
+                body = msg.message.lower()
+                if "login code" in body or "код" in body:
+                    found = OTP_RE.search(msg.message)
+                    if found:
+                        return {
+                            "date": msg.date or datetime.now(timezone.utc),
+                            "code": found.group(1),
+                            "chat": dialog.name or str(dialog.id),
+                        }
         return None
 
-    code = await _scan()
-    if code:
-        return code
-
-    deadline = asyncio.get_event_loop().time() + timeout
-    while asyncio.get_event_loop().time() < deadline:
+    result = await _scan()
+    if result:
+        return result
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
         await asyncio.sleep(2)
-        code = await _scan()
-        if code:
-            return code
+        result = await _scan()
+        if result:
+            return result
     return None
 
 
+async def read_otp(client: TelegramClient, timeout: int = 25):
+    result = await fetch_otp(client, timeout=timeout)
+    if not result:
+        return None
+    return result["date"], result["code"], result["chat"]
+
+
+async def clear_all(client: TelegramClient, update_stage=None) -> dict:
+    await _connect(client)
+    stats = {"contacts": 0, "dialogs": 0, "groups": 0, "channels": 0}
+
+    if update_stage:
+        await update_stage("contacts")
+    try:
+        result = await client(functions.contacts.GetContactsRequest(hash=0))
+        users = list(getattr(result, "users", []) or [])
+        if users:
+            await client(functions.contacts.DeleteContactsRequest(id=users))
+            stats["contacts"] = len(users)
+    except FloodWaitError as exc:
+        await _sleep_flood(exc)
+    except Exception:
+        pass
+
+    if update_stage:
+        await update_stage("dialogs")
+
+    me = await client.get_me()
+    async for dialog in client.iter_dialogs():
+        try:
+            if me and dialog.id == me.id:
+                continue
+            if dialog.is_channel:
+                await client.delete_dialog(dialog.entity)
+                if getattr(dialog.entity, "megagroup", False) or dialog.is_group:
+                    stats["groups"] += 1
+                else:
+                    stats["channels"] += 1
+            elif dialog.is_group:
+                await client.delete_dialog(dialog.entity)
+                stats["groups"] += 1
+            else:
+                await client.delete_dialog(dialog.entity, revoke=True)
+                stats["dialogs"] += 1
+        except FloodWaitError as exc:
+            await _sleep_flood(exc)
+        except Exception:
+            continue
+    return stats
+
+
 async def change_email(client: TelegramClient, email: str, app_password: str) -> None:
-    """Best-effort login-email change via Telegram + IMAP inbox for the code."""
     await _connect(client)
     if not email or not app_password:
-        raise ValueError("GUARD_EMAIL / GUARD_EMAIL_APP_PASSWORD not configured")
+        raise ValueError("Add your mailbox first with /addmail email ---- app_password")
 
-    sent = await client(functions.account.SendVerifyEmailCodeRequest(
-        purpose=types.EmailVerifyPurposeLoginChange(),
-        email=email,
-    ))
+    await client(
+        functions.account.SendVerifyEmailCodeRequest(
+            purpose=types.EmailVerifyPurposeLoginChange(),
+            email=email,
+        )
+    )
     code = await _wait_imap_code(email, app_password, timeout=90)
     if not code:
         raise ValueError(f"No verification code arrived in {email}")
 
-    await client(functions.account.VerifyEmailRequest(
-        purpose=types.EmailVerifyPurposeLoginChange(),
-        verification=types.EmailVerificationCode(code=code),
-    ))
-    return sent
+    await client(
+        functions.account.VerifyEmailRequest(
+            purpose=types.EmailVerifyPurposeLoginChange(),
+            verification=types.EmailVerificationCode(code=code),
+        )
+    )
 
 
-async def _wait_imap_code(email: str, app_password: str, timeout: int = 90) -> str | None:
+def _imap_once(email: str, app_password: str, seen: set[bytes]) -> str | None:
     host = "imap.gmail.com"
     domain = email.rsplit("@", 1)[-1].lower()
     if domain in {"outlook.com", "hotmail.com", "live.com"}:
@@ -234,41 +322,41 @@ async def _wait_imap_code(email: str, app_password: str, timeout: int = 90) -> s
     elif domain in {"yahoo.com", "ymail.com"}:
         host = "imap.mail.yahoo.com"
 
-    deadline = asyncio.get_event_loop().time() + timeout
-    seen: set[bytes] = set()
-
-    while asyncio.get_event_loop().time() < deadline:
+    mail = imaplib.IMAP4_SSL(host, 993)
+    try:
+        mail.login(email, app_password)
+        mail.select("INBOX")
+        _, data = mail.search(None, "UNSEEN")
+        ids = data[0].split() if data and data[0] else []
+        for mid in reversed(ids[-10:]):
+            if mid in seen:
+                continue
+            seen.add(mid)
+            _, msg_data = mail.fetch(mid, "(RFC822)")
+            body = msg_data[0][1]
+            if not body:
+                continue
+            text = body.decode("utf-8", errors="ignore")
+            found = OTP_RE.search(text)
+            if found and ("telegram" in text.lower() or "verify" in text.lower()):
+                return found.group(1)
+        return None
+    finally:
         try:
-            mail = imaplib.IMAP4_SSL(host, 993)
-            mail.login(email, app_password)
-            mail.select("INBOX")
-            _, data = mail.search(None, "UNSEEN")
-            ids = data[0].split() if data and data[0] else []
-            for mid in reversed(ids[-10:]):
-                if mid in seen:
-                    continue
-                seen.add(mid)
-                _, msg_data = mail.fetch(mid, "(RFC822)")
-                body = msg_data[0][1]
-                if not body:
-                    continue
-                text = body.decode("utf-8", errors="ignore")
-                m = OTP_RE.search(text)
-                if m and ("telegram" in text.lower() or "verify" in text.lower()):
-                    mail.logout()
-                    return m.group(1)
             mail.logout()
+        except Exception:
+            pass
+
+
+async def _wait_imap_code(email: str, app_password: str, timeout: int = 90) -> str | None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    seen: set[bytes] = set()
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            code = await asyncio.to_thread(_imap_once, email, app_password, seen)
+            if code:
+                return code
         except Exception:
             pass
         await asyncio.sleep(4)
     return None
-
-
-def fmt_when(dt) -> str:
-    if not dt:
-        return "?"
-    if isinstance(dt, datetime):
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    return str(dt)
