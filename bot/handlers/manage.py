@@ -1,4 +1,4 @@
-from datetime import datetime
+            from datetime import datetime
 
 from telegram import Update
 from telegram.ext import CallbackQueryHandler, ContextTypes, MessageHandler, filters
@@ -108,6 +108,8 @@ async def _manage_hex(update: Update, ctx: ContextTypes.DEFAULT_TYPE, hex_str: s
     ctx.user_data["hex"] = hex_str
     ctx.bot_data["state"].set_hex(uid, hex_str)
 
+    session_string = await session_service.get_session_string(hex_str)
+
     ctx.bot_data["accounts"].upsert(hex_str, {
         "phone": info["phone"],
         "name": info["name"],
@@ -115,6 +117,7 @@ async def _manage_hex(update: Update, ctx: ContextTypes.DEFAULT_TYPE, hex_str: s
         "spam": info["spam"],
         "devices": info["devices"],
         "active": False,
+        "session_string": session_string,
         "verified_at": datetime.utcnow(),
     })
 
@@ -160,7 +163,6 @@ async def dev_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Tap a device to terminate it:"
     )
     await q.edit_message_text(text, reply_markup=device_rows(devices))
-
 
 
 async def dev_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
