@@ -1,4 +1,4 @@
-            from telegram import Update
+from telegram import Update
 from telegram.ext import CallbackQueryHandler, ContextTypes
 
 from bot.keyboards.reply_markups import acc_dash, acc_page, confirm_revoke_acc, main_menu
